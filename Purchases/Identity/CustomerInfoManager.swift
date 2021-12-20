@@ -13,22 +13,14 @@
 
 import Foundation
 
-protocol CustomerInfoManagerDelegate: AnyObject {
-
-    func customerInfoManagerDidReceiveUpdated(customerInfo: CustomerInfo)
-
-}
-
 class CustomerInfoManager {
-
-    weak var delegate: CustomerInfoManagerDelegate?
 
     private(set) var lastSentCustomerInfo: CustomerInfo?
     private let operationDispatcher: OperationDispatcher
     private let deviceCache: DeviceCache
     private let backend: Backend
     private let systemInfo: SystemInfo
-    private let customerInfoCacheLock = NSRecursiveLock()
+    private let customerInfoCacheLock = Lock()
 
     init(operationDispatcher: OperationDispatcher,
          deviceCache: DeviceCache,
@@ -168,28 +160,57 @@ class CustomerInfoManager {
     }
 
     func clearCustomerInfoCache(forAppUserID appUserID: String) {
-        customerInfoCacheLock.lock()
-        deviceCache.clearCustomerInfoCache(appUserID: appUserID)
-        lastSentCustomerInfo = nil
-        customerInfoCacheLock.unlock()
+        customerInfoCacheLock.perform {
+            deviceCache.clearCustomerInfoCache(appUserID: appUserID)
+            lastSentCustomerInfo = nil
+        }
+    }
+
+    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+    var customerInfoStream: AsyncStream<CustomerInfo> {
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let disposable = self.monitorChanges { continuation.yield($0) }
+
+            continuation.onTermination = { @Sendable _ in disposable() }
+        }
+    }
+
+    private var customerInfoChanges: [Int: (CustomerInfo) -> Void] = [:]
+
+    /// Allows monitoring changes to the active `CustomerInfo`.
+    /// - Returns: closure that removes the created observation.
+    /// - Note: this method is not thread-safe.
+    func monitorChanges(_ changes: @escaping (CustomerInfo) -> Void) -> () -> Void {
+        let index = self.customerInfoChanges.keys
+            .sorted().last.map { $0 + 1 } // Next index
+            ?? 0 // Or default to 0
+
+        self.customerInfoChanges[index] = changes
+
+        return { [weak self] in
+            self?.customerInfoChanges.removeValue(forKey: index)
+        }
     }
 
     private func sendUpdateIfChanged(customerInfo: CustomerInfo) {
-        guard let delegate = self.delegate,
-              lastSentCustomerInfo != customerInfo else {
-            return
-        }
+        customerInfoCacheLock.perform {
+            guard !self.customerInfoChanges.isEmpty,
+                  lastSentCustomerInfo != customerInfo else {
+                      return
+                  }
 
-        if lastSentCustomerInfo != nil {
-            Logger.debug(Strings.customerInfo.sending_updated_customerinfo_to_delegate)
-        } else {
-            Logger.debug(Strings.customerInfo.sending_latest_customerinfo_to_delegate)
-        }
+            if lastSentCustomerInfo != nil {
+                Logger.debug(Strings.customerInfo.sending_updated_customerinfo_to_delegate)
+            } else {
+                Logger.debug(Strings.customerInfo.sending_latest_customerinfo_to_delegate)
+            }
 
-        self.lastSentCustomerInfo = customerInfo
-        operationDispatcher.dispatchOnMainThread {
-            self.customerInfoCacheLock.unlock()
-            delegate.customerInfoManagerDidReceiveUpdated(customerInfo: customerInfo)
+            self.lastSentCustomerInfo = customerInfo
+            operationDispatcher.dispatchOnMainThread {
+                for closure in self.customerInfoChanges.values {
+                    closure(customerInfo)
+                }
+            }
         }
     }
 
